@@ -3,6 +3,7 @@
 This document explains how video playback works in Linux at the kernel level, tracing the complete path from a compressed video file to pixels displayed on your screen. We'll explore hardware video decoding, zero-copy buffer sharing, and the modern DRM display pipeline.
 
 ## Table of Contents
+- [Simple Video Player Example](#simple-video-player-example)
 - [Why Can't We Just Decode Video in Userspace?](#why-cant-we-just-decode-video-in-userspace)
 - [High-Level Overview](#high-level-overview)
 - [The Complete Pipeline](#the-complete-pipeline)
@@ -23,6 +24,247 @@ This document explains how video playback works in Linux at the kernel level, tr
 - [Synchronization and Timing](#synchronization-and-timing)
 - [Key Takeaways](#key-takeaways)
 - [Quick Reference](#quick-reference)
+
+## Simple Video Player Example
+
+Before diving into the complex hardware-accelerated pipeline, let's start with a **minimal, educational video player** that demonstrates the fundamentals.
+
+**Code**: `src/simple_video_player.c`
+
+### What It Does
+
+This is a barebones video player that:
+1. **Decodes video using FFmpeg** (software decoding on CPU)
+2. **Displays directly to DRM framebuffer** (no GPU compositing)
+3. **Shows every syscall and kernel interaction**
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────┐
+│         simple_video_player Application          │
+└───────────┬─────────────────────┬────────────────┘
+            │                     │
+            │ FFmpeg libs         │ DRM API
+            │ (userspace)         │ (syscalls)
+            │                     │
+            v                     v
+┌───────────────────┐   ┌────────────────────────┐
+│  libavcodec       │   │   DRM/KMS Driver       │
+│  (CPU decoding)   │   │   (kernel)             │
+└─────────┬─────────┘   └────────┬───────────────┘
+          │                      │
+          │ Decoded RGB          │ mmap()
+          │ frames in RAM        │ framebuffer
+          │                      │
+          v                      v
+    ┌────────────────────────────────────┐
+    │  Framebuffer (mmap'd memory)       │
+    │  Direct CPU write to display RAM   │
+    └──────────────┬─────────────────────┘
+                   │
+                   │ Display controller scans out
+                   v
+            ┌─────────────┐
+            │   DISPLAY   │
+            └─────────────┘
+```
+
+### Key Differences from Production Players
+
+| Aspect | simple_video_player.c | Modern Players (mpv, VLC) |
+|--------|----------------------|---------------------------|
+| **Decoding** | Software (CPU) | Hardware (V4L2) |
+| **Display** | Direct framebuffer write | Wayland/X11 compositor |
+| **Performance** | Slow, high CPU usage | Fast, low power |
+| **Audio** | None | Synchronized audio playback |
+| **Buffer management** | Simple, single buffer | Double/triple buffering |
+| **Use case** | Educational | Production |
+
+### The Complete Flow
+
+```c
+// 1. SETUP DRM
+drm_fd = open("/dev/dri/card0", O_RDWR);
+// SYSCALL: openat(AT_FDCWD, "/dev/dri/card0", O_RDWR)
+
+drmModeGetResources(drm_fd);
+// SYSCALL: ioctl(drm_fd, DRM_IOCTL_MODE_GETRESOURCES, ...)
+// → refs/linux/drivers/gpu/drm/drm_mode_config.c
+
+drmModeGetConnector(drm_fd, connector_id);
+// SYSCALL: ioctl(drm_fd, DRM_IOCTL_MODE_GETCONNECTOR, ...)
+
+drmIoctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_dumb);
+// SYSCALL: ioctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, ...)
+// → Allocates framebuffer in VRAM or system RAM
+
+framebuffer = mmap(NULL, fb_size, PROT_READ | PROT_WRITE, MAP_SHARED, drm_fd, offset);
+// SYSCALL: mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, offset)
+// → Maps framebuffer into process address space
+// → Now CPU can write pixels directly!
+
+drmModeSetCrtc(drm_fd, crtc_id, fb_id, 0, 0, &connector_id, 1, &mode);
+// SYSCALL: ioctl(drm_fd, DRM_IOCTL_MODE_SETCRTC, ...)
+// → Tells display controller to scan out our framebuffer
+
+// 2. SETUP FFMPEG
+avformat_open_input(&format_ctx, filename, NULL, NULL);
+// SYSCALL: openat(AT_FDCWD, "video.mp4", O_RDONLY)
+// SYSCALL: read() to read file header
+
+avcodec_find_decoder(codec_id);
+// No syscall - pure library lookup
+
+avcodec_open2(codec_ctx, codec, NULL);
+// No syscall - initializes decoder state in userspace
+
+// 3. DECODE AND DISPLAY LOOP
+while (av_read_frame(format_ctx, packet) >= 0) {
+    // Read compressed frame from file
+    // SYSCALL: read(video_fd, packet->data, packet->size)
+
+    avcodec_send_packet(codec_ctx, packet);
+    // No syscall - queues packet for decoding
+
+    avcodec_receive_frame(codec_ctx, frame);
+    // PURE CPU WORK - no syscall
+    // Decodes H.264/VP9/AV1 in userspace
+    // This is SLOW but educational
+
+    sws_scale(sws_ctx, frame->data, frame->linesize, 0, height,
+              frame_rgb->data, frame_rgb->linesize);
+    // PURE CPU WORK - converts YUV to RGB and scales
+
+    // Copy to framebuffer (direct memory write!)
+    memcpy(framebuffer, frame_rgb->data[0], screen_width * screen_height * 4);
+    // NO SYSCALL - direct write to mmap'd memory
+    // Display controller automatically scans it out
+
+    usleep(16666);  // ~60 FPS
+    // SYSCALL: nanosleep()
+}
+```
+
+### What You'll Learn
+
+By reading `src/simple_video_player.c`, you'll understand:
+
+1. **DRM/KMS basics**: How to set up direct framebuffer access
+2. **FFmpeg decoding**: How video codecs work in userspace
+3. **Frame timing**: How to synchronize playback to display refresh
+4. **Memory mapping**: How `mmap()` gives direct hardware access
+
+### Compiling and Running
+
+```bash
+# Install dependencies (Debian/Ubuntu)
+sudo apt install libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libdrm-dev
+
+# Install dependencies (Arch Linux)
+sudo pacman -S ffmpeg libdrm
+
+# Compile (Arch Linux)
+gcc -o simple_video_player src/simple_video_player.c \
+    -I/usr/include/libdrm -lavformat -lavcodec -lavutil -lswscale -ldrm -lm
+
+# Compile (Debian/Ubuntu)
+gcc -o simple_video_player src/simple_video_player.c \
+    -lavformat -lavcodec -lavutil -lswscale -ldrm -lm
+```
+
+#### Why Special Permissions Are Required
+
+This player needs **DRM master** privilege to control the display directly. Only one process can be DRM master at a time.
+
+**The Problem:**
+```
+Your Desktop:
+┌─────────────────────────────┐
+│  Wayland/X11 Compositor     │ ← Already has DRM master
+│  (GNOME, KDE, Sway, etc.)   │
+└─────────────────────────────┘
+         │
+         │ Exclusively controls /dev/dri/card0
+         ▼
+    Display Hardware
+
+simple_video_player:
+┌─────────────────────────────┐
+│  simple_video_player        │ ← Wants DRM master
+└─────────────────────────────┘
+         ✗ DENIED! Compositor already has it
+```
+
+**Why This Restriction Exists:**
+
+If any app could take DRM master, malware could:
+- Draw fake login screens
+- Steal passwords by mimicking UI
+- Hide what's actually running on your system
+
+The kernel prevents this by only allowing **one** DRM master at a time.
+
+#### Three Ways to Run
+
+##### Option 1: Run from a TTY (Recommended)
+
+**Best for this educational tool** - clean environment without compositor:
+
+```bash
+# 1. Switch to a text console
+#    Press: Ctrl+Alt+F2 (or F3, F4, etc.)
+
+# 2. Login with your username/password
+
+# 3. Run the player (no sudo needed if you're in video group)
+./simple_video_player video.mp4
+
+# 4. Switch back to your desktop
+#    Press: Ctrl+Alt+F1 (or F7, depending on your system)
+```
+
+**Why this works:** No compositor running = DRM master is free!
+
+##### Option 2: Add yourself to video group
+
+```bash
+# Add yourself to video group
+sudo usermod -a -G video $USER
+
+# Log out and log back in (group membership needs session restart)
+# Then run without sudo:
+./simple_video_player video.mp4
+```
+
+**Limitation:** Still won't work if compositor has DRM master (Wayland session). Use TTY instead.
+
+##### Option 3: Use sudo (Forceful Override)
+
+```bash
+sudo ./simple_video_player video.mp4
+```
+
+**What happens:**
+- Root forcibly takes DRM master from compositor
+- Your desktop screen may go black or freeze
+- Video plays directly on display
+- When finished, you may need to switch back to your session (Ctrl+Alt+F1)
+
+**Warning:** This interrupts your compositor and may require restarting your session.
+
+### Limitations (By Design)
+
+- **No audio**: Video only
+- **No seeking**: Plays from start to finish
+- **Single-threaded**: No parallel decoding
+- **No buffering**: One frame at a time
+- **TTY only**: Won't work under Wayland (compositor has DRM master)
+- **Software decode only**: CPU does all the work
+
+This is intentionally simple to show the core concepts. The rest of this document explains the modern, hardware-accelerated approach.
+
+---
 
 ## Why Can't We Just Decode Video in Userspace?
 
@@ -191,27 +433,27 @@ Without the kernel, processes would fight for the decoder, causing crashes or co
 │  - Extract compressed frames                        │
 │  - Call kernel APIs                                 │
 └────────┬──────────────────────────────┬─────────────┘
-         │                               │
-         │ V4L2 API                      │ DRM API
-         │ (submit frames)               │ (display frames)
-         │                               │
-┌────────▼───────────────────────────────▼─────────────┐
-│                   LINUX KERNEL                       │
-│                                                      │
+         │                              │
+         │ V4L2 API                     │ DRM API
+         │ (submit frames)              │ (display frames)
+         │                              │
+┌────────▼──────────────────────────────▼─────────────┐
+│                   LINUX KERNEL                      │
+│                                                     │
 │  ┌──────────────────┐       ┌──────────────────┐    │
 │  │  V4L2 DRIVER     │       │   DRM DRIVER     │    │
 │  │  - Job queue     │       │   - Framebuffer  │    │
 │  │  - Buffer mgmt   │◄──────┤   - Atomic API   │    │
 │  │  - DMA setup     │ DMABUF│   - Plane mgmt   │    │
 │  └─────────┬────────┘       └──────────┬───────┘    │
-│            │                            │            │
-└────────────┼────────────────────────────┼────────────┘
-             │                            │
-             │ MMIO, DMA, IRQ             │ MMIO, DMA
-             │                            │
-┌────────────▼────────────────────────────▼────────────┐
-│                    HARDWARE                          │
-│                                                      │
+│            │                           │            │
+└────────────┼───────────────────────────┼────────────┘
+             │                           │
+             │ MMIO, DMA, IRQ            │ MMIO, DMA
+             │                           │
+┌────────────▼───────────────────────────▼────────────┐
+│                    HARDWARE                         │
+│                                                     │
 │  ┌────────────────────┐    ┌──────────────────────┐ │
 │  │  VIDEO DECODER     │    │  GPU / DISPLAY       │ │
 │  │  - H.264 engine    │───▶│  - Compositor        │ │

@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <signal.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
@@ -18,6 +19,15 @@ int screen_height = 1080;
 
 // Framebuffer pointer (mmap'd memory)
 uint32_t *framebuffer = NULL;
+
+// Global flag for graceful exit
+volatile int keep_running = 1;
+
+// Signal handler for Ctrl+C
+void signal_handler(int signum) {
+    printf("\n\nReceived signal %d (Ctrl+C), exiting gracefully...\n", signum);
+    keep_running = 0;  // Tell main loop to stop
+}
 
 // =============================================================================
 // SOFTWARE TRIANGLE RASTERIZATION (CPU does the work!)
@@ -93,6 +103,10 @@ int main() {
     int ret;
 
     printf("=== Simple Rotating Triangle (Direct DRM) ===\n\n");
+
+    // Register signal handlers for graceful exit
+    signal(SIGINT, signal_handler);   // Ctrl+C
+    signal(SIGTERM, signal_handler);  // kill command
 
     // =========================================================================
     // STEP 1: OPEN DRM DEVICE
@@ -260,7 +274,8 @@ int main() {
     // =========================================================================
     // STEP 8: RENDER LOOP
     // =========================================================================
-    printf("Step 8: Starting render loop...\n\n");
+    printf("Step 8: Starting render loop...\n");
+    printf("Press Ctrl+C to exit gracefully...\n\n");
 
     // Triangle vertices (in screen space, centered)
     float cx = screen_width / 2.0f;   // Center X
@@ -272,8 +287,8 @@ int main() {
     float v1x = -size, v1y = size;      // Bottom-left
     float v2x = size, v2y = size;       // Bottom-right
 
-    for (int frame = 0; frame < 360; frame++) {
-        float angle = frame * M_PI / 180.0f;  // Degrees to radians
+    for (int frame = 0; keep_running; frame++) {
+        float angle = (frame % 360) * M_PI / 180.0f;  // Degrees to radians, wrap at 360
 
         // =====================================================================
         // CPU RENDERING (Software rasterization)

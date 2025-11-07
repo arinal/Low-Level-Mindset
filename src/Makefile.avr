@@ -1,0 +1,183 @@
+# Makefile for AVR ATmega328P Projects
+#
+# Usage:
+#   make -f Makefile.avr            # Build C version
+#   make -f Makefile.avr asm        # Build assembly version
+#   make -f Makefile.avr all        # Build both
+#   make -f Makefile.avr flash      # Flash C version
+#   make -f Makefile.avr flash-asm  # Flash assembly version
+#   make -f Makefile.avr clean      # Clean up
+
+# MCU Configuration
+MCU = atmega328p
+F_CPU = 16000000UL
+BAUD = 9600
+
+# Programmer Configuration
+PROGRAMMER = usbasp
+# Alternative programmers:
+# PROGRAMMER = arduino
+# PORT = /dev/ttyUSB0
+
+# Toolchain
+CC = avr-gcc
+AS = avr-gcc
+OBJCOPY = avr-objcopy
+SIZE = avr-size
+OBJDUMP = avr-objdump
+AVRDUDE = avrdude
+
+# Compiler Flags
+CFLAGS = -mmcu=$(MCU)
+CFLAGS += -DF_CPU=$(F_CPU)
+CFLAGS += -DBAUD=$(BAUD)
+CFLAGS += -Os                    # Optimize for size
+CFLAGS += -Wall -Wextra         # Enable warnings
+CFLAGS += -std=gnu99            # C99 with GNU extensions
+CFLAGS += -ffunction-sections   # Each function in its own section
+CFLAGS += -fdata-sections       # Each data in its own section
+
+# Linker Flags
+LDFLAGS = -mmcu=$(MCU)
+LDFLAGS += -Wl,--gc-sections    # Garbage collect unused sections
+LDFLAGS += -Wl,-Map=$(TARGET).map  # Generate map file
+
+# Assembler Flags
+ASFLAGS = -mmcu=$(MCU)
+ASFLAGS += -x assembler-with-cpp
+
+# AVRDude Flags
+AVRDUDEFLAGS = -c $(PROGRAMMER)
+AVRDUDEFLAGS += -p $(MCU)
+# Uncomment if using arduino programmer:
+# AVRDUDEFLAGS += -P $(PORT) -b 19200
+
+# Targets
+TARGET = avr_blink
+TARGET_ASM = avr_blink_asm
+
+# Source files
+SRC_C = $(TARGET).c
+SRC_ASM = $(TARGET).asm
+
+# Default target
+.PHONY: all
+all: $(TARGET).hex $(TARGET_ASM).hex size size-asm
+
+# C version
+$(TARGET).elf: $(SRC_C)
+	@echo "Compiling C version..."
+	$(CC) $(CFLAGS) $(LDFLAGS) $(SRC_C) -o $@
+
+$(TARGET).hex: $(TARGET).elf
+	@echo "Creating HEX file..."
+	$(OBJCOPY) -O ihex -R .eeprom $< $@
+	@echo "Done: $@"
+
+# Assembly version
+$(TARGET_ASM).elf: $(SRC_ASM)
+	@echo "Assembling..."
+	$(AS) $(ASFLAGS) -nostartfiles $(SRC_ASM) -o $@
+
+$(TARGET_ASM).hex: $(TARGET_ASM).elf
+	@echo "Creating HEX file..."
+	$(OBJCOPY) -O ihex $< $@
+	@echo "Done: $@"
+
+# Just compile assembly version
+.PHONY: asm
+asm: $(TARGET_ASM).hex size-asm
+
+# Show memory usage
+.PHONY: size
+size: $(TARGET).elf
+	@echo "=== C Version Memory Usage ==="
+	$(SIZE) --format=avr --mcu=$(MCU) $<
+
+.PHONY: size-asm
+size-asm: $(TARGET_ASM).elf
+	@echo "=== Assembly Version Memory Usage ==="
+	$(SIZE) --format=avr --mcu=$(MCU) $<
+
+# Disassemble
+.PHONY: disassemble
+disassemble: $(TARGET).elf
+	$(OBJDUMP) -d -S $< > $(TARGET).lst
+	@echo "Disassembly saved to $(TARGET).lst"
+
+.PHONY: disassemble-asm
+disassemble-asm: $(TARGET_ASM).elf
+	$(OBJDUMP) -d -S $< > $(TARGET_ASM).lst
+	@echo "Disassembly saved to $(TARGET_ASM).lst"
+
+# Flash to MCU
+.PHONY: flash
+flash: $(TARGET).hex
+	@echo "Flashing C version to $(MCU)..."
+	$(AVRDUDE) $(AVRDUDEFLAGS) -U flash:w:$<:i
+
+.PHONY: flash-asm
+flash-asm: $(TARGET_ASM).hex
+	@echo "Flashing assembly version to $(MCU)..."
+	$(AVRDUDE) $(AVRDUDEFLAGS) -U flash:w:$<:i
+
+# Read flash from MCU
+.PHONY: read-flash
+read-flash:
+	@echo "Reading flash from $(MCU)..."
+	$(AVRDUDE) $(AVRDUDEFLAGS) -U flash:r:flash_backup.hex:i
+	@echo "Flash saved to flash_backup.hex"
+
+# Read fuses
+.PHONY: read-fuses
+read-fuses:
+	@echo "Reading fuses from $(MCU)..."
+	$(AVRDUDE) $(AVRDUDEFLAGS) -U lfuse:r:-:h -U hfuse:r:-:h -U efuse:r:-:h
+
+# Set fuses for external 16MHz crystal
+# WARNING: Setting wrong fuses can brick your chip!
+.PHONY: set-fuses
+set-fuses:
+	@echo "WARNING: This will set fuses for external 16MHz crystal"
+	@echo "Press Ctrl-C to cancel, or wait 5 seconds to continue..."
+	@sleep 5
+	$(AVRDUDE) $(AVRDUDEFLAGS) -U lfuse:w:0xFF:m -U hfuse:w:0xDE:m -U efuse:w:0xFD:m
+	@echo "Fuses set. Power cycle the board."
+
+# Verify connection
+.PHONY: check
+check:
+	@echo "Checking connection to $(MCU)..."
+	$(AVRDUDE) $(AVRDUDEFLAGS) -v
+
+# Clean up
+.PHONY: clean
+clean:
+	rm -f $(TARGET).elf $(TARGET).hex $(TARGET).map $(TARGET).lst
+	rm -f $(TARGET_ASM).elf $(TARGET_ASM).hex $(TARGET_ASM).map $(TARGET_ASM).lst
+	rm -f *.o *~
+	@echo "Cleaned up build files"
+
+# Help
+.PHONY: help
+help:
+	@echo "AVR Makefile for ATmega328P"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all              - Build both C and assembly versions"
+	@echo "  asm              - Build only assembly version"
+	@echo "  flash            - Flash C version to MCU"
+	@echo "  flash-asm        - Flash assembly version to MCU"
+	@echo "  size             - Show memory usage (C)"
+	@echo "  size-asm         - Show memory usage (assembly)"
+	@echo "  disassemble      - Generate disassembly listing"
+	@echo "  read-flash       - Read flash from MCU to file"
+	@echo "  read-fuses       - Read fuse settings"
+	@echo "  set-fuses        - Set fuses for 16MHz crystal (CAUTION!)"
+	@echo "  check            - Verify connection to MCU"
+	@echo "  clean            - Remove all build files"
+	@echo ""
+	@echo "Configuration:"
+	@echo "  MCU = $(MCU)"
+	@echo "  F_CPU = $(F_CPU)"
+	@echo "  PROGRAMMER = $(PROGRAMMER)"
